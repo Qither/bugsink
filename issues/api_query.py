@@ -214,4 +214,5 @@ def query_capabilities():
         "identity_fields": list(IDENTITY_FIELDS),
         "matched_event_evidence": True,
         "cross_issue_event_timeline": True,
+        "aggregate_crash_stats": True,
     }

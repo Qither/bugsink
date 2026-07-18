@@ -180,6 +180,90 @@ class EventApiTests(TransactionTestCase):
         self.assertEqual(len(response.json()["results"]), 21)
         self.assertLessEqual(len(queries), 8)
 
+    def test_stats_use_exact_event_time_buckets_and_unresolved_issue_count(self):
+        start = (timezone.now() + timezone.timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        end = start + timezone.timedelta(minutes=15)
+        second_issue = get_or_create_issue(
+            project=self.project,
+            event_data=create_event_data(exception_type="stats-resolved"),
+        )[0]
+        second_issue.is_resolved = True
+        second_issue.save(update_fields=["is_resolved"])
+        create_event(issue=self.issue, timestamp=start)
+        create_event(issue=self.issue, timestamp=start + timezone.timedelta(minutes=6))
+        create_event(issue=second_issue, timestamp=start + timezone.timedelta(minutes=7))
+        create_event(issue=second_issue, timestamp=end)
+
+        other_project = Project.objects.create(name="Other stats project")
+        other_issue = get_or_create_issue(
+            project=other_project,
+            event_data=create_event_data(exception_type="stats-other-project"),
+        )[0]
+        create_event(issue=other_issue, timestamp=start + timezone.timedelta(minutes=8))
+
+        response = self.client.get(
+            reverse("api:event-stats"),
+            {
+                "project": str(self.project.id),
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "interval": "5m",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "time_basis": "event.timestamp",
+            "interval": "5m",
+            "crash_volume": [
+                {"timestamp": start.isoformat().replace("+00:00", "Z"), "value": 1},
+                {
+                    "timestamp": (start + timezone.timedelta(minutes=5)).isoformat().replace("+00:00", "Z"),
+                    "value": 2,
+                },
+                {
+                    "timestamp": (start + timezone.timedelta(minutes=10)).isoformat().replace("+00:00", "Z"),
+                    "value": 0,
+                },
+            ],
+            "issue_count": 1,
+        })
+
+    def test_stats_reject_more_than_200_buckets(self):
+        start = timezone.now().replace(second=0, microsecond=0)
+        response = self.client.get(
+            reverse("api:event-stats"),
+            {
+                "project": str(self.project.id),
+                "start": start.isoformat(),
+                "end": (start + timezone.timedelta(days=2)).isoformat(),
+                "interval": "5m",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"interval": ["Query would return more than 200 buckets."]})
+
+    def test_stats_query_count_is_bounded(self):
+        start = (timezone.now() + timezone.timedelta(hours=1)).replace(second=0, microsecond=0)
+        for offset in range(50):
+            create_event(issue=self.issue, timestamp=start + timezone.timedelta(seconds=offset))
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                reverse("api:event-stats"),
+                {
+                    "project": str(self.project.id),
+                    "start": start.isoformat(),
+                    "end": (start + timezone.timedelta(hours=1)).isoformat(),
+                    "interval": "5m",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(sum(point["value"] for point in response.json()["crash_volume"]), 50)
+        self.assertLessEqual(len(queries), 6)
+
 
 class EventPaginationTests(TransactionTestCase):
     def setUp(self):

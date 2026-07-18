@@ -15,6 +15,7 @@ from issues.models import issue_lookup_kwargs
 from tags.models import EventTag
 
 from .models import Event
+from .api_stats import EventStatsResponseSerializer, get_event_stats
 from .serializers import EventListSerializer, EventDetailSerializer
 from .markdown_stacktrace import render_stacktrace_md
 from .renderers import MarkdownRenderer
@@ -150,6 +151,30 @@ class EventViewSet(AtomicRequestMixin, viewsets.ReadOnlyModelViewSet):
     )
     def list(self, request, *args, **kwargs):
         return super().list(request, *args, **kwargs)
+
+    @extend_schema(
+        summary="Aggregate crash statistics",
+        description=(
+            "Return exact event.timestamp crash-volume buckets and the number of unresolved issues observed in the "
+            "same [start,end) range. Queries are project-scoped, limited to 31 days and at most 200 buckets."
+        ),
+        parameters=[
+            OpenApiParameter("project", OpenApiTypes.INT, OpenApiParameter.QUERY, required=True),
+            OpenApiParameter("start", OpenApiTypes.DATETIME, OpenApiParameter.QUERY, required=True),
+            OpenApiParameter("end", OpenApiTypes.DATETIME, OpenApiParameter.QUERY, required=True),
+            OpenApiParameter(
+                "interval",
+                OpenApiTypes.STR,
+                OpenApiParameter.QUERY,
+                required=True,
+                enum=["5m", "15m", "1h", "1d"],
+            ),
+        ],
+        responses=EventStatsResponseSerializer,
+    )
+    @action(detail=False, methods=["get"], url_path="stats")
+    def stats(self, request):
+        return Response(EventStatsResponseSerializer(get_event_stats(request.query_params)).data)
 
     @extend_schema(
         summary="Retrieve an event",

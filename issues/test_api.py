@@ -119,6 +119,7 @@ class IssueApiTests(TransactionTestCase):
             "identity_fields": ["player_id", "session_id", "release", "build"],
             "matched_event_evidence": True,
             "cross_issue_event_timeline": True,
+            "aggregate_crash_stats": True,
         })
 
     def _create_tagged_event(self, issue, timestamp, tags=None, release=""):
