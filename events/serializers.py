@@ -1,6 +1,8 @@
 from rest_framework import serializers
 from drf_spectacular.utils import extend_schema_field
 from bugsink.api_serializers import UTCModelSerializer
+from issues.api_query import matched_event_identity
+from issues.serializers import MatchedIdentitySerializer
 
 from .markdown_stacktrace import render_stacktrace_md
 from .models import Event
@@ -8,6 +10,8 @@ from .models import Event
 
 class EventListSerializer(UTCModelSerializer):
     """Lightweight list view: excludes the (potentially large) `data` field."""
+
+    identity = serializers.SerializerMethodField()
 
     class Meta:
         model = Event
@@ -21,10 +25,15 @@ class EventListSerializer(UTCModelSerializer):
             "project",
             "timestamp",
             "digest_order",
+            "identity",
         ]
 
+    @extend_schema_field(MatchedIdentitySerializer)
+    def get_identity(self, obj):
+        return MatchedIdentitySerializer(matched_event_identity(obj)).data
 
-class EventDetailSerializer(UTCModelSerializer):
+
+class EventDetailSerializer(EventListSerializer):
     """Detail view: includes full `data` payload."""
     # NOTE as with Issue.grouping_keys: check viewset for prefetching
     # grouping_key = serializers.CharField(source="grouping.grouping_key", read_only=True)

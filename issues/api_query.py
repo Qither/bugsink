@@ -101,11 +101,10 @@ def _any_tag_exists(key):
     return Exists(EventTag.objects.filter(event_id=OuterRef("pk"), value__key__key=key))
 
 
-def _matching_events(query):
+def _apply_event_filters(events, query):
     project_id = query.data["project"]
     tag_value_ids = _tag_value_ids(project_id, query.data)
-    events = Event.objects.filter(
-        issue_id=OuterRef("pk"),
+    events = events.filter(
         project_id=project_id,
         timestamp__gte=query.data["start"],
         timestamp__lt=query.data["end"],
@@ -143,6 +142,16 @@ def _matching_events(query):
             events = events.filter(has_any_player_id=False, has_user_id=True)
 
     return events.order_by("-timestamp", "-id")
+
+
+def _matching_events(query):
+    return _apply_event_filters(Event.objects.filter(issue_id=OuterRef("pk")), query)
+
+
+def filter_events_for_event_query(queryset, query):
+    if not query.uses_events:
+        raise serializers.ValidationError({"start": ["start and end are required for cross-issue event queries."]})
+    return _apply_event_filters(queryset, query)
 
 
 def filter_issues_for_event_query(queryset, query):
@@ -204,4 +213,5 @@ def query_capabilities():
         "same_event_conjunction": True,
         "identity_fields": list(IDENTITY_FIELDS),
         "matched_event_evidence": True,
+        "cross_issue_event_timeline": True,
     }

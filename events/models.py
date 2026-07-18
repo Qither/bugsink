@@ -171,6 +171,7 @@ class Event(models.Model):
             models.Index(fields=["project", "digested_at"]),  # project-wide quota check
             models.Index(fields=["digested_at", "digest_order"]),  # check_for_thresholds, see #322
             models.Index(fields=["issue", "timestamp", "id"], name="event_issue_time_id"),
+            models.Index(fields=["project", "timestamp", "id"], name="event_project_time_id"),
         ]
 
     def get_raw_data(self):

@@ -1,5 +1,8 @@
 from bugsink.test_utils import TransactionTestCase25251 as TransactionTestCase
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from projects.models import Project
@@ -9,6 +12,7 @@ from events.api_views import EventViewSet
 
 from issues.factories import get_or_create_issue
 from events.factories import create_event_data
+from tags.models import store_tags
 
 
 class EventApiTests(TransactionTestCase):
@@ -22,11 +26,11 @@ class EventApiTests(TransactionTestCase):
         self.issue, _ = get_or_create_issue(project=self.project)
         self.event = create_event(issue=self.issue)
 
-    def test_list_requires_scope(self):
+    def test_cross_issue_list_requires_project(self):
         response = self.client.get(reverse("api:event-list"))
 
         self.assertEqual(response.status_code, 400)
-        self.assertEqual({'issue': ['This field is required.']}, response.json())
+        self.assertEqual({'project': ['This field is required.']}, response.json())
 
     def test_detail_by_id(self):
         url = reverse("api:event-detail", args=[self.event.id])
@@ -102,6 +106,80 @@ class EventApiTests(TransactionTestCase):
         self.assertEqual(ids[0], str(e0.id))
         self.assertEqual(ids[1], str(e1.id))
 
+    def test_cross_issue_query_is_exact_and_returns_identity_evidence(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        second_issue = get_or_create_issue(
+            project=self.project,
+            event_data=create_event_data(exception_type="second"),
+        )[0]
+        split_player = create_event(issue=self.issue, timestamp=start + timezone.timedelta(minutes=1))
+        store_tags(split_player, self.issue, {"player_id": "player-1"})
+        split_session = create_event(issue=self.issue, timestamp=start + timezone.timedelta(minutes=2))
+        store_tags(split_session, self.issue, {"session_id": "session-1", "build": "100"})
+        matched = create_event(
+            issue=second_issue,
+            timestamp=start + timezone.timedelta(minutes=3),
+            release="1.0.0",
+        )
+        store_tags(
+            matched,
+            second_issue,
+            {"player_id": "player-1", "session_id": "session-1", "build": "100"},
+        )
+        at_end = create_event(issue=second_issue, timestamp=end, release="1.0.0")
+        store_tags(
+            at_end,
+            second_issue,
+            {"player_id": "player-1", "session_id": "session-1", "build": "100"},
+        )
+
+        response = self.client.get(
+            reverse("api:event-list"),
+            {
+                "project": str(self.project.id),
+                "start": start.isoformat(),
+                "end": end.isoformat(),
+                "player_id": "player-1",
+                "session_id": "session-1",
+                "release": "1.0.0",
+                "build": "100",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()["results"]
+        self.assertEqual([row["id"] for row in rows], [str(matched.id)])
+        self.assertNotIn("data", rows[0])
+        self.assertEqual(rows[0]["identity"], {
+            "player_id": "player-1",
+            "player_id_source": "player_id",
+            "session_id": "session-1",
+            "release": "1.0.0",
+            "build": "100",
+        })
+
+    def test_cross_issue_identity_serialization_has_bounded_queries(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        for offset in range(20):
+            event = create_event(issue=self.issue, timestamp=start + timezone.timedelta(seconds=offset))
+            store_tags(event, self.issue, {"player_id": f"player-{offset}", "session_id": "session"})
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                reverse("api:event-list"),
+                {
+                    "project": str(self.project.id),
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()["results"]), 21)
+        self.assertLessEqual(len(queries), 8)
+
 
 class EventPaginationTests(TransactionTestCase):
     def setUp(self):
@@ -148,3 +226,38 @@ class EventPaginationTests(TransactionTestCase):
 
         r2 = self.client.get(r1.json()["next"])
         self.assertEqual(self._ids(r2), [str(events[2].id), str(events[3].id)])
+
+    def test_cross_issue_timestamp_desc_two_pages(self):
+        project = Project.objects.create(name="Timeline")
+        issue0 = get_or_create_issue(
+            project=project,
+            event_data=create_event_data(exception_type="timeline-0"),
+        )[0]
+        issue1 = get_or_create_issue(
+            project=project,
+            event_data=create_event_data(exception_type="timeline-1"),
+        )[0]
+        start = timezone.now().replace(microsecond=0)
+        events = [
+            create_event(
+                issue=issue0 if offset % 2 == 0 else issue1,
+                timestamp=start + timezone.timedelta(seconds=offset),
+            )
+            for offset in range(5)
+        ]
+
+        r1 = self.client.get(
+            reverse("api:event-list"),
+            {
+                "project": str(project.id),
+                "start": start.isoformat(),
+                "end": (start + timezone.timedelta(hours=1)).isoformat(),
+                "limit": 2,
+            },
+        )
+        self.assertEqual(r1.status_code, 200)
+        self.assertEqual(self._ids(r1), [str(events[4].id), str(events[3].id)])
+
+        r2 = self.client.get(r1.json()["next"])
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(self._ids(r2), [str(events[2].id), str(events[1].id)])

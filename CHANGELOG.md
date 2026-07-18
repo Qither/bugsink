@@ -6,6 +6,8 @@
 
 Add an exact same-event issue query extension to the canonical issue API. The issue list can now filter by event
 timestamp, player/session identity, release, and build, and returns matched-event evidence plus a capabilities endpoint.
+The canonical event list also supports exact cross-issue timeline queries over the same fields, with cursor pagination,
+identity evidence, and a project/timestamp/id index for stable bounded reads.
 
 ## 2.4.0 (10 July 2026)
 
