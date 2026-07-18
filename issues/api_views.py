@@ -10,6 +10,12 @@ from bugsink.api_mixins import AtomicRequestMixin
 from bugsink.utils import assert_
 
 from .models import Issue, IssueStateManager, TurningPoint, apply_issue_action, issue_lookup_kwargs
+from .api_query import (
+    filter_issues_for_event_query,
+    get_matched_events,
+    parse_issue_event_query,
+    query_capabilities as get_query_capabilities,
+)
 from .serializers import (
     IssueCommentSerializer,
     IssueMuteForSerializer,
@@ -37,18 +43,23 @@ class IssuesCursorPagination(CursorPagination):
     # reshuffle things causing misses or duplicates. However, this is the desired UX for a "recent activity" view.
     # i.e. the typical usage would in fact just be to get the "first page" of recent activity.
     page_size = 250
+    page_size_query_param = "limit"
+    max_page_size = 100
     default_direction = "asc"
     default_sort = "digest_order"
 
-    VALID_SORTS = ("digest_order", "last_seen")
+    VALID_SORTS = ("digest_order", "last_seen", "matched_at")
     VALID_ORDERS = ("asc", "desc")
 
     def get_ordering(self, request, queryset, view):
-        sort = request.query_params.get("sort", self.default_sort)
+        event_query = "start" in request.query_params and "end" in request.query_params
+        default_sort = "matched_at" if event_query else self.default_sort
+        sort = request.query_params.get("sort", default_sort)
         if sort not in self.VALID_SORTS:
-            raise ValidationError({"sort": ["Must be 'digest_order' or 'last_seen'."]})
+            raise ValidationError({"sort": ["Must be 'digest_order', 'last_seen' or 'matched_at'."]})
 
-        order = request.query_params.get("order", self.default_direction)
+        default_order = "desc" if sort == "matched_at" else self.default_direction
+        order = request.query_params.get("order", default_order)
         if order not in self.VALID_ORDERS:
             raise ValidationError({"order": ["Must be 'asc' or 'desc'."]})
 
@@ -57,6 +68,11 @@ class IssuesCursorPagination(CursorPagination):
         if sort == "digest_order":
             # Unique per project; stable cursor once filtered by project.
             return ["-digest_order" if desc else "digest_order"]
+
+        if sort == "matched_at":
+            if desc:
+                return ["-matched_at", "-matched_event_id", "-id"]
+            return ["matched_at", "matched_event_id", "id"]
 
         # sort == "last_seen": timestamp needs a deterministic tie-breaker.
         if desc:
@@ -72,6 +88,11 @@ class IssueViewSet(AtomicRequestMixin, viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         return self.queryset
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        context["matched_events"] = getattr(self, "matched_events", {})
+        return context
 
     @extend_schema(
         summary="List issues",
@@ -89,7 +110,7 @@ class IssueViewSet(AtomicRequestMixin, viewsets.ReadOnlyModelViewSet):
                 type=OpenApiTypes.STR,
                 location=OpenApiParameter.QUERY,
                 required=False,
-                enum=["digest_order", "last_seen"],
+                enum=["digest_order", "last_seen", "matched_at"],
                 description="Sort mode (default: digest_order).",
             ),
             OpenApiParameter(
@@ -100,10 +121,76 @@ class IssueViewSet(AtomicRequestMixin, viewsets.ReadOnlyModelViewSet):
                 enum=["asc", "desc"],
                 description="Sort order (default: asc).",
             ),
+            OpenApiParameter(
+                name="start",
+                type=OpenApiTypes.DATETIME,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Start of event timestamp interval, inclusive. Requires end.",
+            ),
+            OpenApiParameter(
+                name="end",
+                type=OpenApiTypes.DATETIME,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="End of event timestamp interval, exclusive. Requires start.",
+            ),
+            OpenApiParameter(
+                name="player_id",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter to issues with one matching event carrying this player_id or user.id.",
+            ),
+            OpenApiParameter(
+                name="session_id",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter to issues with one matching event carrying this session_id tag.",
+            ),
+            OpenApiParameter(
+                name="release",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter to issues with one matching event carrying this release.",
+            ),
+            OpenApiParameter(
+                name="build",
+                type=OpenApiTypes.STR,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Filter to issues with one matching event carrying this build tag.",
+            ),
+            OpenApiParameter(
+                name="limit",
+                type=OpenApiTypes.INT,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description="Page size, 1..100.",
+            ),
         ]
     )
     def list(self, request, *args, **kwargs):
-        return super().list(request, *args, **kwargs)
+        queryset = self.filter_queryset(self.get_queryset())
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            self.matched_events = get_matched_events(page)
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        self.matched_events = get_matched_events(queryset)
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
+    @extend_schema(
+        summary="Describe issue query capabilities",
+        description="Return the Bugsink fork exact event issue query extension capabilities.",
+    )
+    @action(detail=False, methods=["get"], url_path="query-capabilities")
+    def query_capabilities(self, request):
+        return Response(get_query_capabilities())
 
     @extend_schema(
         summary="Retrieve an issue",
@@ -127,12 +214,8 @@ class IssueViewSet(AtomicRequestMixin, viewsets.ReadOnlyModelViewSet):
         if self.action != "list":
             return queryset
 
-        project = self.request.query_params.get("project")
-        if not project:
-            # the below at least until we have a UI for cross-project Issue listing, i.e. #190
-            raise ValidationError({"project": ["This field is required."]})
-
-        return queryset.filter(project=project)
+        query = parse_issue_event_query(self.request.query_params)
+        return filter_issues_for_event_query(queryset, query)
 
     def get_object(self):
         """

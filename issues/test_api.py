@@ -1,6 +1,8 @@
 from bugsink.test_utils import TransactionTestCase25251 as TransactionTestCase
+from django.db import connection
 from django.urls import reverse
 from django.utils import timezone
+from django.test.utils import CaptureQueriesContext
 
 from rest_framework.test import APIClient
 
@@ -10,6 +12,7 @@ from releases.models import create_release_if_needed
 from issues.models import Issue, TurningPoint, TurningPointKind
 from issues.factories import get_or_create_issue
 from events.factories import create_event, create_event_data
+from tags.models import store_tags
 
 from issues.api_views import IssueViewSet
 
@@ -101,7 +104,202 @@ class IssueApiTests(TransactionTestCase):
             {"project": str(self.project.id), "sort": "nope"},
         )
         self.assertEqual(r.status_code, 400)
-        self.assertEqual(r.json(), {"sort": ["Must be 'digest_order' or 'last_seen'."]})
+        self.assertEqual(r.json(), {"sort": ["Must be 'digest_order', 'last_seen' or 'matched_at'."]})
+
+    def test_query_capabilities(self):
+        response = self.client.get(reverse("api:issue-query-capabilities"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "extension": "exact-event-issue-query",
+            "version": 1,
+            "time_basis": "event.timestamp",
+            "interval": "[start,end)",
+            "max_window_days": 31,
+            "same_event_conjunction": True,
+            "identity_fields": ["player_id", "session_id", "release", "build"],
+            "matched_event_evidence": True,
+        })
+
+    def _create_tagged_event(self, issue, timestamp, tags=None, release=""):
+        event = create_event(issue=issue, timestamp=timestamp, release=release)
+        if tags:
+            store_tags(event, issue, tags)
+        return event
+
+    def _event_query_params(self, start, end, **extra):
+        params = {
+            "project": str(self.project.id),
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+        }
+        params.update(extra)
+        return params
+
+    def test_event_time_filter_uses_start_inclusive_end_exclusive(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        before = self._create_tagged_event(self.issue0, start - timezone.timedelta(seconds=1))
+        at_start = self._create_tagged_event(self.issue0, start)
+        at_end = self._create_tagged_event(self.issue1, end)
+        self.assertIsNotNone(before)
+        self.assertIsNotNone(at_end)
+
+        response = self.client.get(reverse("api:issue-list"), self._event_query_params(start, end))
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()["results"]
+        self.assertEqual([row["id"] for row in rows], [str(self.issue0.id)])
+        self.assertEqual(rows[0]["matched_event"]["id"], str(at_start.id))
+
+    def test_event_identity_filters_must_match_one_event(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        self._create_tagged_event(self.issue0, start, tags={"player_id": "p1"})
+        self._create_tagged_event(
+            self.issue0,
+            start + timezone.timedelta(minutes=1),
+            tags={"session_id": "s1"},
+        )
+        matched = self._create_tagged_event(
+            self.issue1,
+            start + timezone.timedelta(minutes=2),
+            tags={"player_id": "p1", "session_id": "s1", "build": "123"},
+            release="1.0.0",
+        )
+
+        response = self.client.get(
+            reverse("api:issue-list"),
+            self._event_query_params(
+                start,
+                end,
+                player_id="p1",
+                session_id="s1",
+                release="1.0.0",
+                build="123",
+            ),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()["results"]
+        self.assertEqual([row["id"] for row in rows], [str(self.issue1.id)])
+        self.assertEqual(rows[0]["matched_event"]["id"], str(matched.id))
+        self.assertEqual(rows[0]["matched_event"]["identity"], {
+            "player_id": "p1",
+            "player_id_source": "player_id",
+            "session_id": "s1",
+            "release": "1.0.0",
+            "build": "123",
+        })
+
+    def test_player_id_falls_back_to_user_id_when_player_id_tag_missing(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        matched = self._create_tagged_event(self.issue0, start, tags={"user.id": "fallback-player"})
+        self._create_tagged_event(
+            self.issue1,
+            start,
+            tags={"player_id": "other-player", "user.id": "fallback-player"},
+        )
+
+        response = self.client.get(
+            reverse("api:issue-list"),
+            self._event_query_params(start, end, player_id="fallback-player"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()["results"]
+        self.assertEqual([row["id"] for row in rows], [str(self.issue0.id)])
+        self.assertEqual(rows[0]["matched_event"]["id"], str(matched.id))
+        self.assertEqual(rows[0]["matched_event"]["identity"]["player_id_source"], "user.id")
+
+    def test_matched_at_sort_orders_by_matched_event_timestamp(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        early = self._create_tagged_event(self.issue0, start + timezone.timedelta(minutes=1))
+        late = self._create_tagged_event(self.issue1, start + timezone.timedelta(minutes=2))
+        self.assertIsNotNone(early)
+        self.assertIsNotNone(late)
+
+        response = self.client.get(
+            reverse("api:issue-list"),
+            self._event_query_params(start, end, sort="matched_at", order="desc", limit="1"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        rows = response.json()["results"]
+        self.assertEqual([row["id"] for row in rows], [str(self.issue1.id)])
+        self.assertIsNotNone(response.json()["next"])
+
+    def test_event_query_defaults_to_latest_matched_event(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        self._create_tagged_event(self.issue0, start + timezone.timedelta(minutes=1))
+        latest = self._create_tagged_event(self.issue1, start + timezone.timedelta(minutes=2))
+
+        response = self.client.get(
+            reverse("api:issue-list"),
+            self._event_query_params(start, end, limit="1"),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["results"][0]["id"], str(self.issue1.id))
+        self.assertEqual(response.json()["results"][0]["matched_event"]["id"], str(latest.id))
+
+    def test_event_identity_query_has_bounded_database_round_trips(self):
+        start = timezone.now().replace(microsecond=0)
+        end = start + timezone.timedelta(hours=1)
+        self._create_tagged_event(
+            self.issue0,
+            start,
+            tags={"player_id": "p1", "session_id": "s1", "build": "123"},
+            release="1.0.0",
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            response = self.client.get(
+                reverse("api:issue-list"),
+                self._event_query_params(
+                    start,
+                    end,
+                    player_id="p1",
+                    session_id="s1",
+                    release="1.0.0",
+                    build="123",
+                    limit="100",
+                ),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        select_queries = [
+            query for query in queries.captured_queries if query["sql"].lstrip().upper().startswith("SELECT")
+        ]
+        self.assertLessEqual(
+            len(select_queries),
+            5,
+            "Unexpected query plan:\n" + "\n".join(query["sql"] for query in queries.captured_queries),
+        )
+        # AtomicRequestMixin adds BEGIN/COMMIT around the five bounded reads.
+        self.assertLessEqual(len(queries), 7)
+
+    def test_event_query_validation(self):
+        start = timezone.now().replace(microsecond=0)
+        response = self.client.get(reverse("api:issue-list"), {"project": str(self.project.id), "player_id": "p1"})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"start": ["start and end are required for event filters."]})
+
+        response = self.client.get(
+            reverse("api:issue-list"),
+            {"project": str(self.project.id), "sort": "matched_at"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"sort": ["matched_at requires event filters."]})
+
+        response = self.client.get(
+            reverse("api:issue-list"),
+            self._event_query_params(start, start, limit="101"),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("limit", response.json())
 
     def test_resolve(self):
         response = self.client.post(reverse("api:issue-resolve", args=[self.issue0.id]))

@@ -1,5 +1,12 @@
 # Changes
 
+## Unreleased
+
+### Fork extensions
+
+Add an exact same-event issue query extension to the canonical issue API. The issue list can now filter by event
+timestamp, player/session identity, release, and build, and returns matched-event evidence plus a capabilities endpoint.
+
 ## 2.4.0 (10 July 2026)
 
 ### Backwards incompatible changes

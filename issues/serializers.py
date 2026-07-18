@@ -1,17 +1,39 @@
 import datetime
 
 from django.utils import timezone
+from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
 from bugsink.api_serializers import UTCModelSerializer
 from bugsink.period_utils import DATEUTIL_KWARGS_MAP
+from issues.api_query import matched_event_identity
 
 from .models import Issue, TurningPoint, TurningPointKind, issue_lookup_kwargs
+
+
+class MatchedIdentitySerializer(serializers.Serializer):
+    player_id = serializers.CharField(allow_null=True)
+    player_id_source = serializers.CharField(allow_null=True)
+    session_id = serializers.CharField(allow_null=True)
+    release = serializers.CharField(allow_null=True)
+    build = serializers.CharField(allow_null=True)
+
+
+class MatchedEventSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    timestamp = serializers.DateTimeField(default_timezone=datetime.timezone.utc)
+    ingested_at = serializers.DateTimeField(default_timezone=datetime.timezone.utc)
+    identity = serializers.SerializerMethodField()
+
+    @extend_schema_field(MatchedIdentitySerializer)
+    def get_identity(self, obj):
+        return MatchedIdentitySerializer(matched_event_identity(obj)).data
 
 
 class IssueSerializer(UTCModelSerializer):
     # grouping_keys = serializers.SerializerMethodField()  # read-only list of strings
     friendly_id = serializers.CharField(read_only=True)
+    matched_event = serializers.SerializerMethodField()
 
     class Meta:
         model = Issue
@@ -41,9 +63,22 @@ class IssueSerializer(UTCModelSerializer):
             # "fixed_at",  too "raw"? i.e. too implementation-tied?
             # "events_at",  too "raw"? i.e. too implementation-tied?
             "is_muted",
+            "matched_event",
             # "unmute_on_volume_based_conditions",  too "raw"? i.e. too implementation-tied?
             # "grouping_keys",  TODO (likely) once we have the "expand" idea implemented
         ]
+
+    @extend_schema_field(MatchedEventSerializer)
+    def get_matched_event(self, obj):
+        matched_event_id = getattr(obj, "matched_event_id", None)
+        if matched_event_id is None:
+            return None
+
+        event = self.context.get("matched_events", {}).get(matched_event_id)
+        if event is None:
+            return None
+
+        return MatchedEventSerializer(event).data
 
     # def get_grouping_keys(self, obj):
     #     # TODO: prefetch grouping_key in IssueViewSet

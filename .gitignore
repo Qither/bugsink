@@ -6,6 +6,7 @@ __pycache__
 # Virtual Environments / build
 /.env
 /.venv
+/build/
 /bin/
 /include/
 /lib/
@@ -15,6 +16,7 @@ __pycache__
 /bugsink.egg-info/
 /bugsink/_version.py
 /dist/
+/.omx/
 
 # This matches the filestorage mentioned in development.py
 /filestorage

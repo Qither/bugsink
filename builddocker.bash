@@ -1,71 +1,94 @@
 #!/bin/bash
-set -e
+set -euo pipefail
 
-if [ -n "$1" ]; then
-    WHEEL_FILE=$1
-else
-    WHEEL_FILE=$(ls dist/ -1atr | grep bugsink | grep whl | tail -n1)
-fi
+usage() {
+    cat <<'EOF'
+Usage: ./builddocker.bash [wheel-file] [--publish] [--validate]
 
-echo "Building docker image with wheel file: $WHEEL_FILE"
+Environment:
+  BUGSINK_IMAGE_REPO      Image repository to tag. Default: bugsink-fork
+  BUGSINK_IMAGE_TAG       Image tag. Default: version from wheel, with + changed to -
+  BUGSINK_PUBLISH=1       Push after a successful build.
+  BUGSINK_VALIDATE=1      Inspect the image after build/publish.
+EOF
+}
 
-if [ -z "$1" ]; then
-    echo "Is this the correct wheel file? [y/n]"
-    read -r response
-    if [[ ! "$response" =~ ^([yY][eE][sS]|[yY])$ ]]; then
-        echo "Please run the script again with the correct wheel file in the dist/ directory"
+PUBLISH="${BUGSINK_PUBLISH:-0}"
+VALIDATE="${BUGSINK_VALIDATE:-0}"
+WHEEL_FILE=""
+START_DIR=$(pwd)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+resolve_wheel_file() {
+    local input="$1"
+    local candidate="$input"
+    if [[ "$candidate" != /* ]]; then
+        candidate="$START_DIR/$candidate"
+    fi
+    if [ ! -f "$candidate" ]; then
+        echo "Wheel file does not exist: $input" >&2
         exit 1
     fi
+
+    local wheel_dir
+    wheel_dir=$(cd "$(dirname "$candidate")" && pwd -P)
+    if [ "$wheel_dir" != "$SCRIPT_DIR/dist" ]; then
+        echo "Wheel file must be inside bugsink/dist: $input" >&2
+        exit 1
+    fi
+    basename "$candidate"
+}
+
+for arg in "$@"; do
+    case "$arg" in
+        --publish) PUBLISH=1 ;;
+        --validate) VALIDATE=1 ;;
+        --help|-h) usage; exit 0 ;;
+        *)
+            if [ -n "$WHEEL_FILE" ]; then
+                echo "Unexpected argument: $arg" >&2
+                usage >&2
+                exit 2
+            fi
+            WHEEL_FILE=$(resolve_wheel_file "$arg")
+            ;;
+    esac
+done
+
+cd "$SCRIPT_DIR"
+
+if [ -z "$WHEEL_FILE" ]; then
+    WHEEL_FILE=$(find dist -maxdepth 1 -type f -name '*bugsink*.whl' -printf '%T@ %f\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)
+fi
+if [ -z "$WHEEL_FILE" ]; then
+    echo "No Bugsink wheel found. Pass a wheel file or build one into dist/." >&2
+    exit 1
 fi
 
-# example: bugsink-0.1.8.dev5+g200ea5e.d20240827-py3-none-any.whl
+VERSION=$(echo "$WHEEL_FILE" | cut -d'-' -f2)
+DEFAULT_TAG=${VERSION//+/-}
+IMAGE_REPO="${BUGSINK_IMAGE_REPO:-bugsink-fork}"
+IMAGE_TAG="${BUGSINK_IMAGE_TAG:-$DEFAULT_TAG}"
+IMAGE_REF="${IMAGE_REPO}:${IMAGE_TAG}"
 
-# if this a non-dev version, we tag the image with the full version number, major.minor, major, and latest
-# otherwise no tags are added
+echo "Building Bugsink image from wheel: $WHEEL_FILE"
+echo "Image: $IMAGE_REF"
 
-if [[ $WHEEL_FILE == *"dev"* ]]; then
-    echo "This is a dev version, no (numbered) tags will be added, just a :dev tag"
-    TAGS="-t bugsink/bugsink:dev"
+docker build -f Dockerfile.fromwheel --build-arg WHEEL_FILE="$WHEEL_FILE" -t "$IMAGE_REF" .
+
+if [ "$VALIDATE" = "1" ]; then
+    docker image inspect "$IMAGE_REF" >/dev/null
+    echo "Validated local image: $IMAGE_REF"
+fi
+
+if [ "$PUBLISH" = "1" ]; then
+    if [ -z "${BUGSINK_IMAGE_REPO:-}" ]; then
+        echo "Refusing to publish without BUGSINK_IMAGE_REPO. Set it to your fork registry/repository." >&2
+        exit 1
+    fi
+    docker push "$IMAGE_REF"
+    docker buildx imagetools inspect "$IMAGE_REF" >/dev/null
+    echo "Published image: $IMAGE_REF"
 else
-    VERSION=$(echo $WHEEL_FILE | cut -d'-' -f2)
-
-    REPO="bugsink/bugsink"
-
-    # numeric tags for this build
-    TAG_LIST=(
-      "$REPO:$VERSION"
-      "$REPO:$(echo "$VERSION" | awk -F. '{print $1"."$2}')"
-      "$REPO:$(echo "$VERSION" | awk -F. '{print $1}')"
-    )
-
-    # Find highest published semver on Docker Hub (public repo; no auth needed)
-    HIGHEST_PUBLISHED=$(
-      curl -fsSL "https://hub.docker.com/v2/repositories/${REPO}/tags?page_size=100" \
-      | grep -o '"name":"[^"]*"' \
-      | cut -d'"' -f4 \
-      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-      | sort -V \
-      | tail -n1
-    )
-
-    # Decide whether we’re allowed to move :latest forward
-    ADD_LATEST=true
-    if [[ -n "$HIGHEST_PUBLISHED" ]]; then
-      # if VERSION < HIGHEST_PUBLISHED, do NOT set :latest
-      top=$(printf '%s\n%s\n' "$HIGHEST_PUBLISHED" "$VERSION" | sort -V | tail -n1)
-      if [[ "$top" != "$VERSION" ]]; then
-        ADD_LATEST=false
-        echo "Not tagging :latest: $VERSION < already published $HIGHEST_PUBLISHED"
-      fi
-    fi
-
-    # Build TAGS string
-    TAGS=""
-    for t in "${TAG_LIST[@]}"; do TAGS+=" -t $t"; done
-    if $ADD_LATEST; then
-      TAGS+=" -t $REPO:latest -t $REPO"
-      echo "Tagging as latest: $VERSION ≥ ${HIGHEST_PUBLISHED:-<none>}"
-    fi
+    echo "Build complete. Publish explicitly with BUGSINK_PUBLISH=1 BUGSINK_IMAGE_REPO=<registry/repo> $0 $WHEEL_FILE"
 fi
-
-docker build -f Dockerfile.fromwheel --build-arg WHEEL_FILE="$WHEEL_FILE" $TAGS .
